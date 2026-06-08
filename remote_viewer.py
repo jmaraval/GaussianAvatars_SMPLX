@@ -39,7 +39,6 @@ class RemoteViewer(Mini3DViewer):
         self.step = 0  # training step
         self.timestamp_begin = time.time() if self.training else None
         self.elapsed_last = 0  # training time
-
         # network
         self.socket = None
 
@@ -74,6 +73,7 @@ class RemoteViewer(Mini3DViewer):
                 "use_original_mesh": dpg.get_value("_checkbox_use_original_mesh"),
                 "view_matrix": self.cam.world_view_transform.T.flatten().tolist(),  # the transpose is required by gaussian splatting rasterizer
                 "view_projection_matrix": self.cam.full_proj_transform.T.flatten().tolist(),  # the transpose is required by gaussian splatting rasterizer
+                "use_training_camera": dpg.get_value("_checkbox_use_training_camera"),
                 'timestep': self.timestep,
             }
         message_str = json.dumps(message)
@@ -266,23 +266,28 @@ class RemoteViewer(Mini3DViewer):
                 #     self.need_update = True
                 # dpg.add_color_edit((self.bg_color*255).tolist(), label="Background Color", width=200, no_alpha=True, callback=callback_change_bg)
 
-                # # near slider
-                # def callback_set_znear(sender, app_data):
-                #     self.cam.znear = app_data
-                #     self.need_update = True
-                # dpg.add_slider_float(label="near", width=155, min_value=0, max_value=2, format="%.5f", default_value=self.cam.znear, callback=callback_set_znear, tag="_slider_near")
+                # near slider
+                def callback_set_znear(sender, app_data):
+                    self.cam.znear = app_data
+                    self.need_update = True
+                dpg.add_slider_float(label="near", width=155, min_value=0, max_value=2, format="%.5f", default_value=self.cam.znear, callback=callback_set_znear, tag="_slider_near")
 
-                # # far slider
-                # def callback_set_far(sender, app_data):
-                #     self.cam.zfar = app_data
-                #     self.need_update = True
-                # dpg.add_slider_float(label="far", width=155, min_value=1e-3, max_value=2, format="%.5f", default_value=self.cam.zfar, callback=callback_set_far, tag="_slider_far")
+                # far slider
+                def callback_set_zfar(sender, app_data):
+                    self.cam.zfar = app_data
+                    self.need_update = True
+                dpg.add_slider_float(label="far", width=155, min_value=1e-3, max_value=100, format="%.5f", default_value=self.cam.zfar, callback=callback_set_zfar, tag="_slider_far")
 
                 # fov slider
                 def callback_set_fovy(sender, app_data):
                     self.cam.fovy = app_data
                     self.need_update = True
                 dpg.add_slider_int(label="FoV (vertical)", width=155, min_value=1, max_value=120, format="%d deg", default_value=self.cam.fovy, callback=callback_set_fovy, tag="_slider_fovy")
+
+                def callback_set_fovx(sender, app_data):
+                    self.cam.fovy = app_data
+                    self.need_update = True
+                dpg.add_slider_int(label="FoV (horizontal)", width=155, min_value=1, max_value=120, format="%d deg", default_value=self.cam.fovx, callback=callback_set_fovx, tag="_slider_fovx")
 
                 # scaling_modifier slider
                 def callback_set_scaling_modifier(sender, app_data):
@@ -299,9 +304,16 @@ class RemoteViewer(Mini3DViewer):
                         self.need_update = True
                         dpg.set_value("_log_pose", str(self.cam.pose.astype(np.float16)))
                         dpg.set_value("_slider_fovy", self.cam.fovy)
+                        dpg.set_value("_slider_fovx", self.cam.fovx)
                     dpg.add_button(label="reset", tag="_button_reset_pose", callback=callback_reset_camera)
                     with dpg.collapsing_header(label="Camera Pose", default_open=False):
                         dpg.add_text(str(self.cam.pose.astype(np.float16)), tag="_log_pose")
+
+
+                    def callback_use_training_camera(sender, app_data):
+                        self.need_update = True
+                    dpg.add_checkbox(label="use training camera", default_value=False, callback=callback_use_training_camera, tag="_checkbox_use_training_camera")
+  
                 
         # widget-dependent handlers ========================================================================================
         with dpg.handler_registry():

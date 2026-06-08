@@ -180,9 +180,10 @@ class NVDiffRenderer(torch.nn.Module):
             raise NotImplementedError(f"Unknown lighting type: {self.lighting_type}")
         return diffuse
     
+        
     def render_from_camera(
         self, verts, faces, cam: MiniCam, background_color=[1., 1., 1.],
-        face_colors=None,
+        face_colors=None, verts_cam = False
     ):
         """
         Renders meshes into RGBA images
@@ -199,27 +200,30 @@ class NVDiffRenderer(torch.nn.Module):
         if self.use_opengl:
             image_size = cam.image_height, cam.image_width
             
-            return self.render_mesh(verts, faces, RT, full_proj, image_size, background_color, face_colors)
+            return self.render_mesh(verts, faces, RT, full_proj, image_size, background_color, face_colors, verts_cam)
         else:
             if cam.image_height > 2048 or cam.image_width > 2048:
                 image_size = 2048, 2048
             else:
                 image_size = int(cam.image_height // 8 * 8), int(cam.image_width // 8 * 8)
 
-            output = self.render_mesh(verts, faces, RT, full_proj, image_size, background_color, face_colors)
+            output = self.render_mesh(verts, faces, RT, full_proj, image_size, background_color, face_colors, verts_cam)
             for k, v in output.items():
                 output[k] = F.interpolate(v.permute(0, 3, 1, 2), (cam.image_height, cam.image_width), mode='bilinear').permute(0, 2, 3, 1)
             return output
     
     def render_mesh(
         self, verts, faces, RT, full_proj, image_size, background_color=[1., 1., 1.],
-        face_colors=None,
+        face_colors=None, verts_cam = False
     ):
         """
         Renders meshes into RGBA images
         """
-
-        verts_camera = self.world_to_camera(verts, RT)[..., :3]
+        
+        if not verts_cam:
+            verts_camera = self.world_to_camera(verts, RT)[..., :3]
+        else:
+            verts_camera = verts
         verts_clip = self.world_to_clip(verts, None, None, image_size, mvp=full_proj)
         tri = faces.int()
         rast_out, rast_out_db = dr.rasterize(self.glctx, verts_clip, tri, image_size)

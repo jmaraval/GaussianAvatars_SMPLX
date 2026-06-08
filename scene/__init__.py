@@ -21,6 +21,7 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.cameras import Camera
 from scene.gaussian_model import GaussianModel
 from scene.flame_gaussian_model import FlameGaussianModel
+from scene.smplx_gaussian_model import SMPLXGaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 from utils.general_utils import PILtoTorch
@@ -46,9 +47,18 @@ class CameraDataset(torch.utils.data.Dataset):
                 image = camera.image
 
             im_data = np.array(image.convert("RGBA"))
+
+            # Apply foreground mask as alpha channel if available
+            if getattr(camera, 'fg_mask_path', None):
+                fg_mask = Image.open(camera.fg_mask_path).convert('L')
+                H, W = im_data.shape[:2]
+                if fg_mask.size != (W, H):
+                    fg_mask = fg_mask.resize((W, H), Image.LANCZOS)
+                im_data[:, :, 3] = np.array(fg_mask)
+
             norm_data = im_data / 255.0
             arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + camera.bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+            image = Image.fromarray(np.array(arr*255.0, dtype=np.uint8), "RGB")
 
             # ---- from loadCam() and Camera.__init__() ----
             resized_image_rgb = PILtoTorch(image, (camera.image_width, camera.image_height))
@@ -70,7 +80,7 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : Union[GaussianModel, FlameGaussianModel], load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args : ModelParams, gaussians : Union[GaussianModel, FlameGaussianModel, SMPLXGaussianModel], load_iteration=None, shuffle=True, resolution_scales=[1.0]):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -95,6 +105,9 @@ class Scene:
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
+        elif args.source_path.endswith(".pkl") or os.path.exists(os.path.join(args.source_path, "sequences_train.txt")):
+            print("Found SignAvatars-style SMPL-X dataset!")
+            scene_info = sceneLoadTypeCallbacks["SignAvatars"](args.source_path, args.white_background, args.eval)
         else:
             assert False, "Could not recognize scene type!"
 
@@ -105,6 +118,7 @@ class Scene:
         
         if not self.loaded_iter:
             if gaussians.binding == None:
+                print("scene_info.ply_path", scene_info.ply_path)
                 with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
                     dest_file.write(src_file.read())
             json_cams = []
@@ -134,6 +148,7 @@ class Scene:
             self.val_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.val_cameras, resolution_scale, args)
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
+
         
         # process meshes
         if gaussians.binding != None:

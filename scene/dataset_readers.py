@@ -23,6 +23,9 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+import pickle
+from glob import glob
+from math import atan2
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -30,6 +33,26 @@ class CameraInfo(NamedTuple):
     T: np.array
     FovY: np.array
     FovX: np.array
+    image: Optional[np.array]
+    image_path: str
+    image_name: str
+    width: int
+    height: int
+    bg: np.array = np.array([0, 0, 0])
+    timestep: Optional[int] = None
+    camera_id: Optional[int] = None
+    fg_mask_path: Optional[str] = None
+
+class CameraInfoProj(NamedTuple):
+    uid: int
+    R: np.array
+    T: np.array
+    fy: np.array
+    fx: np.array
+    FovX: np.array
+    FovY: np.array
+    cx: np.array
+    cy: np.array
     image: Optional[np.array]
     image_path: str
     image_name: str
@@ -197,7 +220,9 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
         frames = contents["frames"]
         for idx, frame in tqdm(enumerate(frames), total=len(frames)):
             file_path = frame["file_path"]
-            if extension not in frame["file_path"]:
+            # Append default extension only when the path has no extension at all.
+            # (Avoids double-extension like .jpg.png when absolute paths are provided.)
+            if not os.path.splitext(file_path)[1]:
                 file_path += extension
             cam_name = os.path.join(path, file_path)
 
@@ -236,12 +261,20 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             timestep = frame["timestep_index"] if 'timestep_index' in frame else None
             camera_id = frame["camera_index"] if 'camera_id' in frame else None
-            
+
+            # Foreground mask: resolve to absolute path if present
+            fg_mask_path = frame.get("fg_mask_path", None)
+            if fg_mask_path and not os.path.isabs(fg_mask_path):
+                fg_mask_path = os.path.join(path, fg_mask_path)
+            if fg_mask_path and not os.path.exists(fg_mask_path):
+                fg_mask_path = None  # silently ignore missing masks
+
             cam_infos.append(CameraInfo(
-                uid=idx, R=R, T=T, FovY=fovy, FovX=fovx, bg=bg, image=image, 
-                image_path=image_path, image_name=image_name, 
-                width=width, height=height, 
-                timestep=timestep, camera_id=camera_id))
+                uid=idx, R=R, T=T, FovY=fovy, FovX=fovx, bg=bg, image=image,
+                image_path=image_path, image_name=image_name,
+                width=width, height=height,
+                timestep=timestep, camera_id=camera_id,
+                fg_mask_path=fg_mask_path))
     return cam_infos
 
 def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
@@ -351,8 +384,299 @@ def readDynamicNerfInfo(path, white_background, eval, extension=".png", target_p
                            tgt_test_meshes=tgt_test_mesh_infos)
     return scene_info
 
+
+def readCamerasFrompkl(pklfile, global_t, white_background, extension=".png"):
+    cam_infos = []
+    meshes = {}
+
+    print("  loading:", pklfile)
+    with open(pklfile, "rb") as f:
+        try:
+            results = pickle.load(f)
+        except Exception as e:
+            # Some pkls might be saved with protocol issues; re-raise with context
+            raise RuntimeError(f"Failed to load {pklfile}: {e}")
+
+        # detect which keys are present
+        # try common names used in SignAvatar scripts
+        focals = results['focal']
+        princpts = results['princpt']
+        smplx_all = results['smplx']
+
+        # height/width if present
+        height = results['height']
+        width  = results['width']
+
+        if smplx_all is None:
+            raise AssertionError(f"No SMPL-X data found inside {pklfile}. Keys: {list(results.keys())}")
+
+        smplx_all = np.array(smplx_all)  # (N, D) where D typically 182 in SignAvatar
+        N = smplx_all.shape[0]
+
+        # focal/princpt may be per-video or per-frame; normalize to (N,2) and (N,2)
+        if focals is None:
+            # fallback to virtual focal (use width/height heuristics)
+            fx = fy = max(width, height) * 1.5 if (width and height) else 5000.0
+            focals = np.tile(np.array([fx, fy], dtype=np.float32)[None, :], (N, 1))
+        else:
+            focals = np.array(focals)
+            if focals.ndim == 1:
+                focals = np.tile(focals[None, :], (N, 1))
+            elif focals.shape[0] != N:
+                # broadcast if single set provided
+                focals = np.tile(focals[0:1, :], (N, 1))
+
+        if princpts is None:
+            px = width / 2.0 if width else 0.0
+            py = height / 2.0 if height else 0.0
+            princpts = np.tile(np.array([px, py], dtype=np.float32)[None, :], (N, 1))
+        else:
+            princpts = np.array(princpts)
+            if princpts.ndim == 1:
+                princpts = np.tile(princpts[None, :], (N, 1))
+            elif princpts.shape[0] != N:
+                princpts = np.tile(princpts[0:1, :], (N, 1))
+
+        # If dataset provides a list of valid frame indices, use it, otherwise assume 0..N-1
+        valid_indices = results.get('total_valid_index', None)
+        if valid_indices is None:
+            indices = list(range(1,N))
+        else:
+            indices = list(valid_indices)
+
+        # prepare images folder (if any)
+        pattern = r"^(?P<IDVID>[^_]+)_(?P<num_sentence>\d+)-(?P<IDSIGNER>[^-]+)-rgb_front\.pkl$"
+        import re
+        match = re.match(pattern, os.path.basename(pklfile))
+        if not match:
+            raise ValueError(f"Filename does not match expected format: {os.path.basename(pklfile)}")
+        id_vid =match.group("IDVID")
+        num_sentence = match.group("num_sentence")
+        id_signer = match.group("IDSIGNER")
+
+        images_folder = os.path.join("/home/jmaraval/Documents/GaussianAvatars/data/SignAvatars/how2sign/", id_signer,id_vid, num_sentence, "images")
+        images_exist = os.path.isdir(images_folder)
+
+        # iterate frames in this pkl
+        for local_idx, frame_idx in enumerate(indices):
+            # handle case where results['smplx'] is N x D and indices refers to indices into it
+            smplx_vec = smplx_all[local_idx] if local_idx < smplx_all.shape[0] else smplx_all[frame_idx]
+
+            # unpack vector according to SignAvatar snippet:
+            # 0:3 global orient
+            # 3:66 body_pose (63)
+            # 66:111 left hand (45)
+            # 111:156 right hand (45)
+            # 156:159 jaw (3)
+            # 159:169 betas (10)
+            # 169:179 expression (10)
+            # 179:182 cam_trans (3)
+            if smplx_vec.size < 182:
+                # fallback: maybe the vector is already a dict per-frame
+                if isinstance(smplx_vec, dict):
+                    # try to use explicit keys
+                    global_orient = np.array(smplx_vec.get('global_orient', np.zeros(3)), dtype=np.float32)
+                    body_pose = np.array(smplx_vec.get('body_pose', np.zeros(63)), dtype=np.float32)
+                    left_hand = np.array(smplx_vec.get('left_hand_pose', np.zeros(45)), dtype=np.float32)
+                    right_hand = np.array(smplx_vec.get('right_hand_pose', np.zeros(45)), dtype=np.float32)
+                    jaw = np.array(smplx_vec.get('jaw_pose', np.zeros(3)), dtype=np.float32)
+                    betas = np.array(smplx_vec.get('betas', np.zeros(10)), dtype=np.float32)
+                    expr = np.array(smplx_vec.get('expression', np.zeros(10)), dtype=np.float32)
+                    cam_trans = np.array(smplx_vec.get('transl', np.zeros(3)), dtype=np.float32)
+                else:
+                    raise AssertionError("Unexpected SMPL-X vector size: {}".format(smplx_vec.size))
+            else:
+                global_orient = np.array(smplx_vec[0:3], dtype=np.float32)
+                body_pose = np.array(smplx_vec[3:66], dtype=np.float32)
+                left_hand = np.array(smplx_vec[66:111], dtype=np.float32)
+                right_hand = np.array(smplx_vec[111:156], dtype=np.float32)
+                jaw = np.array(smplx_vec[156:159], dtype=np.float32)
+                betas = np.array(smplx_vec[159:169], dtype=np.float32)
+                expr = np.array(smplx_vec[169:179], dtype=np.float32)
+                cam_trans = np.array(smplx_vec[179:182], dtype=np.float32)
+
+
+            # intrinsics for this frame
+            focal_frame = focals[local_idx]
+            princpt_frame = princpts[local_idx]
+            fx, fy = float(focal_frame[0]), float(focal_frame[1])
+            cx, cy = float(princpt_frame[0]), float(princpt_frame[1])
+
+
+            # image path if available: try by frame index naming convention (frame_idx.png)
+            image_path = None
+            image_obj = None
+            if images_exist:
+                # try a few filename patterns
+                candidate_names = [
+                    f"{frame_idx:05d}.png",
+                    f"{frame_idx:06d}.png",
+                    f"{local_idx:05d}.png",
+                    f"{local_idx:06d}.png",
+                    f"{frame_idx}.png",
+                ]
+                for name in candidate_names:
+                    p = os.path.join(images_folder, name)
+                    if os.path.exists(p):
+                        image_path = p
+
+            # Build CameraInfo — we set R as identity and T as cam_trans (camera-centered translation)
+
+            R = np.eye(3, dtype=np.float32)
+            #R = np.array([
+            #    [1,  0,  0],
+            #    [0, -1,  0],
+            #    [0,  0, -1],
+            #], dtype=np.float32)
+            #T = cam_trans.astype(np.float32)
+            T = np.zeros(3, dtype=np.float32)
+
+            FoVx = focal2fov(fx, width)
+            FoVy = focal2fov(fy, height)
+
+            cam_uid = global_t
+            cam_info = CameraInfoProj(
+                uid=cam_uid,
+                R=R,
+                T=T,
+                fy=fy,
+                fx=fx,
+                FovX=FoVx,
+                FovY=FoVy,
+                cx=cx,
+                cy=cy,
+                image=image_obj,
+                image_path=image_path,
+                image_name=os.path.basename(image_path) if image_path else f"{cam_uid}",
+                width=width if width else 0,
+                height=height if height else 0,
+                bg=np.array([1,1,1]) if white_background else np.array([0,0,0]),
+                timestep=global_t,
+                camera_id=0
+            )
+
+            # assign to train/test depending on eval flag; here we keep simple: all as train unless eval True
+            if eval and (len(cam_infos) < max(1, int(0.1 * (len(pklfile) * N)))):
+                cam_infos.append(cam_info)
+            else:
+                cam_infos.append(cam_info)
+
+            # Mesh param dict expected by SMPLXGaussianModel (numpy arrays)
+            mesh_param = {
+                "betas": betas.astype(np.float32),
+                "expr": expr.astype(np.float32),
+                "body_pose": body_pose.astype(np.float32),
+                "jaw_pose": jaw.astype(np.float32),
+                "left_hand_pose": left_hand.astype(np.float32),
+                "right_hand_pose": right_hand.astype(np.float32),
+                "rotation": global_orient.astype(np.float32),  # named 'rotation' to mimic flame naming in some code paths
+                "global_orient": global_orient.astype(np.float32),
+                "translation": cam_trans.astype(np.float32),
+                # dynamic_offset not present — will be initialized by model
+                "dynamic_offset": cam_trans.astype(np.float32),
+            }
+
+            # store in train_meshes by timestep
+            meshes[global_t] = mesh_param
+
+            global_t += 1
+
+    return cam_infos, meshes, global_t
+
+def readSignAvatarsSceneInfo(path, white_background, eval, extension=".png"):
+    """
+    Loader for SignAvatar-style SMPL-X `.pkl` files.
+    Supports either:
+      - path/  (containing many .pkl files, each per sequence)
+      - a single .pkl file passed as `path`
+
+    Produces a SceneInfo with train/test camera lists and per-frame smplx parameter dicts:
+      train_meshes[timestep] = {'betas':..., 'expression':..., 'body_pose':..., 'jaw_pose':..., 'left_hand_pose':..., 'right_hand_pose':..., 'global_orient':..., 'translation':...}
+    """
+    print("Reading SignAvatar dataset at:", path)
+
+    pkl_paths = []
+    pkl_paths_test = None
+    if os.path.isfile(path) and path.lower().endswith(".pkl"):
+        pkl_paths = [path]
+    elif os.path.isfile(os.path.join(path, "sequences_train.txt")):
+        annot_path="/home/jmaraval/Documents/SignAvatars/datasets/language2motion/annotations/SMPL-X"
+        with open(os.path.join(path, "sequences_train.txt")) as file:
+            pkl_paths = [os.path.join(annot_path,line.rstrip()) for line in file]
+        if os.path.isfile(os.path.join(path, "sequences_test.txt")):
+            with open(os.path.join(path, "sequences_test.txt")) as file:
+                pkl_paths_test = [os.path.join(annot_path,line.rstrip()) for line in file]
+    else:
+        raise AssertionError(f"No .pkl found at {path}")
+
+    
+
+    train_cam_infos = []
+    val_cam_infos = []
+    test_cam_infos = []
+    train_meshes = {}
+    test_meshes = {}
+
+    # timestep counter across all pkls (keeps unique timesteps)
+    global_t = 0
+
+    for pkl_file in pkl_paths:
+        cam_infos, meshes, global_t = readCamerasFrompkl(pkl_file, global_t, white_background, extension)
+        train_cam_infos.extend(cam_infos)
+        train_meshes.update(meshes)
+
+    for pkl_file in pkl_paths_test:
+        cam_infos, meshes, global_t = readCamerasFrompkl(pkl_file, global_t, white_background, extension)
+        test_cam_infos.extend(cam_infos)
+        test_meshes.update(meshes)
+    
+    # choose splits: if eval requested, use test_cam_infos else empty
+#    if eval:
+#        # if test list empty, move last 10% frames to test
+#        if len(test_cam_infos) == 0 and len(train_cam_infos) > 0:
+#            n_test = max(1, int(0.1 * len(train_cam_infos)))
+#            test_cam_infos = train_cam_infos[-n_test:]
+#            train_cam_infos = train_cam_infos[:-n_test]
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    ply_path=None
+    pcd=None
+#    if not os.path.exists(ply_path):
+#        # Since this data set has no colmap data, we start with random points
+#        num_pts = 100_000
+#        print(f"Generating random point cloud ({num_pts})...")
+#        
+#        # We create random points inside the bounds of the synthetic Blender scenes
+#        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+#        shs = np.random.random((num_pts, 3)) / 255.0
+#        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+#
+#        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+#    try:
+#        pcd = fetchPly(ply_path)
+#    except:
+#        pcd = None
+
+    scene_info = SceneInfo(
+        point_cloud=pcd,
+        train_cameras=train_cam_infos,
+        test_cameras=test_cam_infos,
+        val_cameras=val_cam_infos,
+        nerf_normalization=nerf_normalization,
+        ply_path=ply_path,
+        train_meshes=train_meshes,
+        test_meshes=test_meshes,
+        tgt_train_meshes={},
+        tgt_test_meshes={},
+    )
+
+
+    print(f"SignAvatar loader: {len(train_cam_infos)} train cams, {len(test_cam_infos)} test cams, {len(train_meshes)} mesh frames")
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "DynamicNerf" : readDynamicNerfInfo,
     "Blender" : readNerfSyntheticInfo,
+    "SignAvatars": readSignAvatarsSceneInfo,
 }

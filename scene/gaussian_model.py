@@ -143,8 +143,16 @@ class GaussianModel:
             return self._xyz
         else:
             # Toyota Motor Europe NV/SA and its affiliated companies retain all intellectual property and proprietary rights in and to the following code lines and related documentation. Any commercial use, reproduction, disclosure or distribution of these code lines and related documentation without an express license agreement from Toyota Motor Europe NV/SA is strictly prohibited.
+            
             if self.face_center is None:
                 self.select_mesh_by_timestep(0)
+
+            #print("self.face_orien_mat[self.binding].shape",self.face_orien_mat[self.binding].shape)
+            #print("self._xyz[..., None].shape",self._xyz[..., None].shape)
+            #print("self.binding.shape", self.binding.shape)
+            #print("self.binding[:10]", self.binding[:10])
+            #print("_xyz shape:", self._xyz.shape)
+            #print("What _xyz represents?")
             
             xyz = torch.bmm(self.face_orien_mat[self.binding], self._xyz[..., None]).squeeze(-1)
             return xyz * self.face_scaling[self.binding] + self.face_center[self.binding]

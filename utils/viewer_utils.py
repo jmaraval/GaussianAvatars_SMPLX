@@ -15,6 +15,7 @@ from pathlib import Path
 import os
 from dataclasses import dataclass
 import dearpygui.dearpygui as dpg
+from scipy.spatial.transform import Rotation as Rscipy
 
 
 def projection_from_intrinsics(K: np.ndarray, image_size: Tuple[int], near: float=0.01, far:float=10, flip_y: bool=False, z_sign=-1):
@@ -70,8 +71,47 @@ def projection_from_intrinsics(K: np.ndarray, image_size: Tuple[int], near: floa
     return proj
 
 
+def init_orbit_camera_from_training(cam_data, znear=0.01, zfar=10):
+    fovx = cam_data["FoVx"],
+    fovy = cam_data["FoVy"],
+    R = cam_data["R"]
+    T = cam_data["T"]
+    W = cam_data["width"]
+    H = cam_data["height"]
+
+    print("R", R)
+
+
+    # Camera center in world coords
+    cam_center = -R.T @ T
+
+    # Orbit camera parameters
+    look_at = np.zeros(3, dtype=np.float32)
+    radius = np.linalg.norm(cam_center)
+
+    # Rotation: camera-to-world
+    rot = Rscipy.from_matrix(R.T)
+
+    print("fovy",fovy)
+
+    cam = OrbitCamera(
+        W=W,
+        H=H,
+        r=radius,
+        fovy=fovy,
+        znear=znear,
+        zfar=zfar,
+        convention="opengl",
+    )
+
+    cam.look_at = look_at
+    cam.rot = rot
+
+    return cam
+
+
 class OrbitCamera:
-    def __init__(self, W, H, r=2, fovy=60, znear=0.01, zfar=10, convention: Literal["opengl", "opencv"]="opengl", save_path='camera.json'):
+    def __init__(self, W, H, r=2, fovy=60, znear=0.01, zfar=10, rot=np.eye(3), convention: Literal["opengl", "opencv"]="opengl", save_path='camera.json'):
         self.image_width = W
         self.image_height = H
         self.radius_default = r
@@ -80,6 +120,8 @@ class OrbitCamera:
         self.zfar = zfar
         self.convention = convention
         self.save_path = save_path
+        self.rot_default = R.from_matrix(rot)
+        self.default_look_at = np.array([0, 0, 0], dtype=np.float32)
 
         self.reset()
         self.load()
@@ -88,8 +130,8 @@ class OrbitCamera:
         """ The internal state of the camera is based on the OpenGL convention, but 
             properties are converted to the target convention when queried.
         """
-        self.rot = R.from_matrix([[1, 0, 0], [0, 1, 0], [0, 0, 1]])  # OpenGL convention
-        self.look_at = np.array([0, 0, 0], dtype=np.float32)  # look at this point
+        self.rot = self.rot_default  # OpenGL convention
+        self.look_at = self.default_look_at  # look at this point
         self.radius = self.radius_default  # camera distance from center
         self.fovy = self.fovy_default
         if self.convention == "opencv":
@@ -210,7 +252,6 @@ class Mini3DViewerConfig:
     radius: float = 1
     """default GUI camera radius from center"""
     fovy: float = 20
-    """default GUI camera fovy"""
 
 class Mini3DViewer:
     def __init__(self, cfg: Mini3DViewerConfig, title='Mini3DViewer'):
